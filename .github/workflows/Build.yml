@@ -11,10 +11,10 @@ on:
         description: "SUSFS commit hash (empty = latest on gki-android12-5.10)"
         required: false
         default: ""
-      ksu_ref:
-        description: "KernelSU-Next branch / tag (SUSFS-enabled branch, e.g. dev_susfs)"
-        required: true
-        default: "dev_susfs"
+      ksun_branch:
+        description: "KernelSU-Next branch passed to setup.sh"
+        required: false
+        default: "dev-susfs"
       device_name:
         description: "Optional label for artifact naming"
         required: false
@@ -23,6 +23,14 @@ on:
         description: "Enable Baseband Guard (BBG)"
         required: true
         default: "true"
+      enable_nomount:
+        description: "Built-in NoMount (CONFIG_NOMOUNT=y) from maxsteeel/nomount"
+        required: true
+        default: "true"
+      nomount_branch:
+        description: "maxsteeel/nomount branch for kernel/setup.sh (README example uses dev)"
+        required: false
+        default: "dev"
 
 env:
   VERSION: android12-5.10
@@ -90,12 +98,10 @@ jobs:
         run: |
           cd kernel_workspace/common/arch/arm64/configs
           {
-            # KernelSU-Next built-in
             echo "CONFIG_KSU=y"
             echo "CONFIG_KPROBES=y"
             echo "CONFIG_HAVE_KPROBES=y"
             echo "CONFIG_KPROBE_EVENTS=y"
-
             echo "CONFIG_KSU_SUSFS=y"
             echo "CONFIG_KSU_SUSFS_SUS_PATH=y"
             echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y"
@@ -184,58 +190,80 @@ jobs:
             sed -i -e 's/goto show_pad;/return 0;/' ./fs/proc/task_mmu.c
           fi
 
-      # Clang builds the GKI tree with -Werror, and fs/susfs.c ships two static
-      # helpers that nothing calls with this config -> -Wunused-function becomes
-      # a hard error. Mark them __maybe_unused, with a pragma fallback.
-      - name: Fix SUSFS unused-function build errors (fs/susfs.c)
+      - name: Setup KernelSU-Next
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
-          [ -f fs/susfs.c ] || { echo "::error::fs/susfs.c not found"; exit 1; }
-          perl -0pi -e 's/^static(?!\s+__maybe_unused)(\s+(?:struct\s+cred\s*\*|void\s+))(susfs_switch_to_ksu_domain|susfs_restore_creds)\b/static __maybe_unused$1$2/mg' fs/susfs.c
-          if grep -nE '__maybe_unused[^;]*(susfs_switch_to_ksu_domain|susfs_restore_creds)' fs/susfs.c; then
-            echo "[ok] susfs unused helpers marked __maybe_unused"
-          else
-            echo "::warning::helper definitions not matched — adding file-local -Wunused-function ignore pragma"
-            grep -q 'Wunused-function' fs/susfs.c || sed -i '1i #pragma clang diagnostic ignored "-Wunused-function"' fs/susfs.c
-          fi
+          curl -LSs "https://raw.githubusercontent.com/pershoot/KernelSU-Next/${{ github.event.inputs.ksun_branch }}/kernel/setup.sh" | bash -s "${{ github.event.inputs.ksun_branch }}"
 
-      # KernelSU-Next is built INTO the kernel (CONFIG_KSU=y). Its setup.sh links
-      # KernelSU-Next/kernel into common/drivers/kernelsu and wires
-      # drivers/Makefile + drivers/Kconfig. A SUSFS-enabled branch (dev_susfs)
-      # already carries the KernelSU-side SUSFS code, so the driver-side
-      # 10_enable_susfs_for_ksu.patch is NOT applied here.
-      - name: Setup KernelSU-Next (built-in)
-        working-directory: kernel_workspace
+          [ -d KernelSU-Next/kernel ] || { echo "::error::KernelSU-Next/kernel missing after setup"; exit 1; }
+          [ -e drivers/kernelsu ] || { echo "::error::drivers/kernelsu symlink missing"; exit 1; }
+          grep -q 'kernelsu' drivers/Makefile || { echo "::error::drivers/Makefile not wired for kernelsu"; exit 1; }
+          grep -q 'kernelsu' drivers/Kconfig || { echo "::error::drivers/Kconfig not wired for kernelsu"; exit 1; }
+          echo "KernelSU-Next commit: $(git -C KernelSU-Next rev-parse --short HEAD) | count: $(git -C KernelSU-Next rev-list --count HEAD)"
+
+      - name: Fix KernelSU-Next (static.patch)
+        working-directory: kernel_workspace/common/KernelSU-Next
+        run: |
+          set -euo pipefail
+          cat > static.patch << 'STATIC_PATCH_EOF'
+          diff --git a/kernel/feature/selinux_hide.c b/kernel/feature/selinux_hide.c
+          index e1384d9..56e4cfe 100644
+          --- a/kernel/feature/selinux_hide.c
+          +++ b/kernel/feature/selinux_hide.c
+          @@ -35,12 +35,12 @@ bool ksu_selinux_hide_enabled __read_mostly = false;
+           bool ksu_selinux_hide_running __read_mostly = false;
+
+           #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+          -static int security_context_to_sid_with_policy(struct selinux_policy *policy, const char *scontext, u32 scontext_len,
+          -                                               u32 *sid, u32 def_sid, gfp_t gfp_flags);
+          -static int security_sid_to_context_with_policy(struct selinux_policy *policy, u32 sid, char **scontext,
+          -                                               u32 *scontext_len);
+          -static void security_compute_av_user_with_policy(struct selinux_policy *policy, u32 ssid, u32 tsid, u16 tclass,
+          -                                                 struct av_decision *avd);
+          +int security_context_to_sid_with_policy(struct selinux_policy *policy, const char *scontext, u32 scontext_len,
+          +                                        u32 *sid, u32 def_sid, gfp_t gfp_flags);
+          +int security_sid_to_context_with_policy(struct selinux_policy *policy, u32 sid, char **scontext,
+          +                                        u32 *scontext_len);
+          +void security_compute_av_user_with_policy(struct selinux_policy *policy, u32 ssid, u32 tsid, u16 tclass,
+          +                                          struct av_decision *avd);
+           static void (*security_dump_masked_av_fn)(struct policydb *policydb, struct context *scontext, struct context *tcontext,
+                                                     u16 tclass, u32 permissions, const char *reason) = NULL;
+           static void (*context_struct_compute_av_fn)(struct policydb *policydb, struct context *scontext,
+          STATIC_PATCH_EOF
+          patch -p1 --forward < static.patch || echo "::warning::static.patch did not apply — may already be fixed upstream, not fatal"
+          rm -f static.patch static.patch.orig
+
+      # ============================================================
+      # NoMount (built-in)
+      # ============================================================
+      - name: Integrate NoMount (built-in)
+        if: ${{ github.event.inputs.enable_nomount == 'true' }}
+        working-directory: kernel_workspace/common
         env:
-          KSU_REF: ${{ github.event.inputs.ksu_ref }}
+          NM_BRANCH: ${{ github.event.inputs.nomount_branch }}
         run: |
           set -euo pipefail
-          KSU_REF="${KSU_REF:-dev_susfs}"
-          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/${KSU_REF}/kernel/setup.sh" | bash -s "${KSU_REF}"
+          NM_BRANCH="${NM_BRANCH:-dev}"
 
-          # Verify the integration actually landed
-          [ -f common/drivers/kernelsu/Kbuild ] || { echo "::error::drivers/kernelsu is missing or broken"; exit 1; }
-          grep -q 'kernelsu' common/drivers/Makefile || { echo "::error::drivers/Makefile not wired for kernelsu"; exit 1; }
-          grep -q 'kernelsu' common/drivers/Kconfig || { echo "::error::drivers/Kconfig does not source kernelsu"; exit 1; }
-          echo "KernelSU-Next ref: ${KSU_REF}"
+          curl -fsSL "https://raw.githubusercontent.com/maxsteeel/nomount/refs/heads/${NM_BRANCH}/kernel/setup.sh" | bash -s "${NM_BRANCH}" \
+            || echo "::warning::NoMount setup.sh failed — trying manual integration"
 
-      # make mrproper runs before any .config exists, so CONFIG_KSU_SUSFS is still
-      # unset and KernelSU-Next's Kbuild hard check
-      # `$(error "KernelSU requires either CONFIG_KPROBES=y or CONFIG_KSU_SUSFS=y")`
-      # kills the build. Delete that line (the real build still has both configs set).
-      - name: Remove KernelSU-Next pre-config Kbuild hard check
-        working-directory: kernel_workspace/common
-        run: |
-          set -euo pipefail
-          KB="drivers/kernelsu/Kbuild"
-          [ -f "$KB" ] || { echo "::error::$KB not found"; exit 1; }
-          if grep -q 'KernelSU requires' "$KB"; then
-            sed -i '/\$(error "KernelSU requires/d' "$KB"
-            echo "[ok] removed pre-config hard check from $KB"
-          else
-            echo "[info] no hard check found in $KB — nothing to remove"
+          if [ ! -f fs/nomount/Kconfig ] || ! grep -q 'nomount' fs/Makefile || ! grep -q 'nomount' fs/Kconfig; then
+            echo "::warning::setup.sh result incomplete — doing manual integration"
+            rm -rf /tmp/nomount_src
+            git clone --depth=1 -b "${NM_BRANCH}" https://github.com/maxsteeel/nomount.git /tmp/nomount_src
+            mkdir -p fs/nomount
+            cp -f /tmp/nomount_src/kernel/src/* fs/nomount/
+            grep -q 'fs/nomount/Kconfig' fs/Kconfig || echo 'source "fs/nomount/Kconfig"' >> fs/Kconfig
+            grep -q 'CONFIG_NOMOUNT' fs/Makefile || echo 'obj-$(CONFIG_NOMOUNT) += nomount/' >> fs/Makefile
           fi
+
+          [ -f fs/nomount/Kconfig ] || { echo "::error::fs/nomount/Kconfig missing"; exit 1; }
+          grep -q 'nomount' fs/Makefile || { echo "::error::fs/Makefile not wired for nomount"; exit 1; }
+          grep -q 'nomount' fs/Kconfig || { echo "::error::fs/Kconfig does not source nomount"; exit 1; }
+          echo "CONFIG_NOMOUNT=y" >> arch/arm64/configs/gki_defconfig
+          echo "NoMount integrated: $(ls fs/nomount | wc -l) files (branch ${NM_BRANCH})"
 
       - name: Install Baseband Guard (BBG)
         if: ${{ github.event.inputs.enable_bbg == 'true' }}
@@ -529,7 +557,7 @@ jobs:
           chmod +x scripts/setlocalversion.orig
           cat > scripts/setlocalversion << 'SETLOCALVERSION_EOF'
           #!/bin/sh
-          printf -- '-BLAZE-KSUNext-STABLE\n'
+          printf -- '-BLAZE-KSUN-STABLE\n'
           SETLOCALVERSION_EOF
           chmod +x scripts/setlocalversion
 
@@ -568,9 +596,6 @@ jobs:
 
       - name: Build kernel
         working-directory: kernel_workspace
-        env:
-          # Safety net: never let a leftover unused static helper break the build
-          KCFLAGS: "-Wno-error=unused-function"
         run: |
           set -euo pipefail
           export KBUILD_BUILD_USER="builder"
@@ -582,17 +607,15 @@ jobs:
           CCACHE_DIR="${{ env.CCACHE_DIR }}" \
           build/build.sh -j"$(nproc)"
 
-      - name: Verify KernelSU-Next + SUSFS are built into the kernel
+      - name: Verify NoMount is built into the kernel
+        if: ${{ github.event.inputs.enable_nomount == 'true' }}
         working-directory: kernel_workspace
         run: |
           set -euo pipefail
           CFG="$(find out -name .config -path '*common*' | head -n1)"
           [ -n "$CFG" ] || { echo "::error::final .config not found under out/"; exit 1; }
-          echo "Using $CFG"
-          for opt in CONFIG_KSU CONFIG_KSU_SUSFS CONFIG_KPROBES; do
-            grep -q "^${opt}=y$" "$CFG" || { echo "::error::${opt}=y is missing from the final .config (dropped by a Kconfig dependency?)"; exit 1; }
-          done
-          grep -E '^CONFIG_KSU' "$CFG"
+          grep -q '^CONFIG_NOMOUNT=y$' "$CFG" || { echo "::error::CONFIG_NOMOUNT=y is missing from the final .config (dropped by a Kconfig dependency?)"; exit 1; }
+          grep -E '^CONFIG_(KSU|NOMOUNT)' "$CFG"
 
       - name: Locate built Image
         working-directory: kernel_workspace
